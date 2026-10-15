@@ -1,5 +1,6 @@
 
 import asyncio
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -10,7 +11,11 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
 
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+X_COOKIES = os.getenv("X_COOKIES")
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения BOT_TOKEN")
@@ -46,32 +51,50 @@ def is_x_url(url: str) -> bool:
 
 def download_video(url: str, folder: str) -> Path:
     output_template = str(Path(folder) / "%(id)s.%(ext)s")
+    cookies_path = None
 
-    ydl_opts = {
-        # Предпочитаем MP4 с уже объединёнными дорожками.
-        # Если такого формата нет, используем лучший доступный.
-        "format": "best[ext=mp4]/best",
-        "outtmpl": output_template,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "socket_timeout": 30,
-        "retries": 2,
-    }
+    try:
+        ydl_opts = {
+            "format": "best[ext=mp4]/best",
+            "outtmpl": output_template,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": 30,
+            "retries": 2,
+        }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+        # Создаём временный файл cookies только при наличии переменной.
+        if X_COOKIES:
+            fd, cookies_path = tempfile.mkstemp(suffix=".txt")
 
-    files = [
-        path for path in Path(folder).iterdir()
-        if path.is_file()
-        and not path.name.endswith((".part", ".ytdl"))
-    ]
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                f.write(X_COOKIES.strip() + "\n")
 
-    if not files:
-        raise RuntimeError("Не удалось получить видеофайл.")
+            ydl_opts["cookiefile"] = cookies_path
 
-    return max(files, key=lambda path: path.stat().st_size)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        files = [
+            path for path in Path(folder).iterdir()
+            if path.is_file()
+            and not path.name.endswith((".part", ".ytdl"))
+            and path.name != "cookies.txt"
+        ]
+
+        if not files:
+            raise RuntimeError("Не удалось получить видеофайл.")
+
+        return max(files, key=lambda path: path.stat().st_size)
+
+    finally:
+        # Удаляем временный файл с авторизационными cookies.
+        if cookies_path:
+            try:
+                os.remove(cookies_path)
+            except OSError:
+                logger.warning("Не удалось удалить временный файл cookies.")
 
 
 @dp.message(F.text)
@@ -87,14 +110,11 @@ async def download_video_handler(message: types.Message):
     status_msg = await message.answer("Скачиваю видео, подожди...")
 
     try:
-        # У каждого запроса своя временная папка.
         with tempfile.TemporaryDirectory() as temp_dir:
             video_path = await asyncio.to_thread(
                 download_video, url, temp_dir
             )
 
-            # Не пытаемся отправлять заведомо большие файлы.
-            # Это консервативный порог для обычного облачного Bot API.
             if video_path.stat().st_size > 49 * 1024 * 1024:
                 await status_msg.edit_text(
                     "Видео слишком большое для отправки этим ботом "
@@ -104,23 +124,20 @@ async def download_video_handler(message: types.Message):
 
             await status_msg.edit_text("Отправляю видео...")
 
-            video_file = types.FSInputFile(str(video_path))
-
             await message.answer_video(
-                video=video_file,
+                video=types.FSInputFile(str(video_path)),
                 caption="Готово!"
             )
 
         await status_msg.delete()
 
     except Exception as e:
-        import logging
-        logging.exception("Ошибка при обработке видео")
+        logger.exception("Ошибка при обработке видео")
 
         error_text = f"{type(e).__name__}: {e}"
         await status_msg.edit_text(
-            f"Не удалось обработать видео.\n\n"
-            f"Ошибка: {error_text[:2500]}"
+            "Не удалось обработать видео.\n\n"
+            f"Ошибка: {error_text[:1500]}"
         )
 
 
