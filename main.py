@@ -1,6 +1,8 @@
 import asyncio
+import base64
 import logging
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -22,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 X_COOKIES = os.getenv("X_COOKIES")
+X_COOKIES_B64 = os.getenv("X_COOKIES_B64")
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения BOT_TOKEN")
@@ -29,73 +32,104 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-HTTPONLY_PREFIX = "#HttpOnly_"
-X_DOMAINS = {"x.com": "twitter.com", "twitter.com": "x.com"}
-
 
 # ---------- Подготовка cookies ----------
 
+# Одна запись Netscape cookies.txt: 7 полей, разделённых любыми пробельными
+# символами (табы, пробелы, даже переносы, если панель всё испортила).
+COOKIE_RE = re.compile(
+    r"(#HttpOnly_)?(\.?[A-Za-z0-9.\-]+)\s+(TRUE|FALSE)\s+(\S+)\s+"
+    r"(TRUE|FALSE)\s+(-?\d+)\s+(\S+)\s+(\S+)",
+    re.IGNORECASE,
+)
+
+
+def load_raw_cookies() -> tuple[str | None, str]:
+    """Берёт cookies из X_COOKIES_B64 (приоритет) или из X_COOKIES."""
+    if X_COOKIES_B64 and X_COOKIES_B64.strip():
+        try:
+            compact = "".join(X_COOKIES_B64.split())
+            decoded = base64.b64decode(compact).decode("utf-8-sig")
+            return decoded, "X_COOKIES_B64"
+        except Exception as e:
+            logger.warning(
+                "Не удалось декодировать X_COOKIES_B64: %s", type(e).__name__
+            )
+    return X_COOKIES, "X_COOKIES"
+
+
 def prepare_cookies() -> str | None:
     """
-    Разбирает X_COOKIES, чинит формат (табы, переносы, HttpOnly),
-    дублирует куки для x.com и twitter.com и возвращает
-    готовое содержимое Netscape cookies.txt.
+    Находит все записи cookies в тексте независимо от того, как панель
+    испортила переносы и табы, дублирует их для x.com и twitter.com
+    и возвращает содержимое Netscape cookies.txt.
     Значения cookies никогда не попадают в логи.
     """
-    if not X_COOKIES or not X_COOKIES.strip():
+    raw, source = load_raw_cookies()
+
+    if not raw or not raw.strip():
         logger.warning(
-            "X_COOKIES не задана или пуста. "
-            "Загрузка будет без авторизации."
+            "Cookies не заданы (%s пуста). Загрузка будет без авторизации.",
+            source,
         )
         return None
 
-    raw = X_COOKIES.strip()
-    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    raw = raw.strip().replace("\r\n", "\n").replace("\r", "\n")
 
-    # Если панель сохранила переносы как буквальные \n.
+    # Если панель сохранила переносы или табы как буквальные \n и \t.
     if "\n" not in raw and "\\n" in raw:
         raw = raw.replace("\\n", "\n")
+    if "\t" not in raw and "\\t" in raw:
+        raw = raw.replace("\\t", "\t")
+
+    # Диагностика формата без вывода значений.
+    logger.info(
+        "Источник=%s, длина=%d, строк=%d, табов=%d, "
+        "начинается_с_#=%s, есть_auth_token=%s, есть_ct0=%s",
+        source,
+        len(raw),
+        raw.count("\n") + 1,
+        raw.count("\t"),
+        raw.lstrip().startswith("#"),
+        "auth_token" in raw,
+        "ct0" in raw,
+    )
 
     result_lines: list[str] = []
     seen: set[str] = set()
     names: set[str] = set()
-    bad_lines = 0
-    fixed_spaces = 0
     expired_auth = False
     now = time.time()
 
-    for line in raw.split("\n"):
-        stripped = line.strip()
-        if not stripped:
-            continue
+    for m in COOKIE_RE.finditer(raw):
+        (
+            httponly,
+            domain,
+            subdomains,
+            path,
+            secure,
+            expiry,
+            name,
+            value,
+        ) = m.groups()
 
-        # Обычные комментарии пропускаем (заголовок добавим сами),
-        # а #HttpOnly_ — это настоящие куки.
-        if stripped.startswith("#") and not stripped.startswith(HTTPONLY_PREFIX):
-            continue
-
-        parts = stripped.split("\t")
-        if len(parts) < 7:
-            # Табы могли превратиться в пробелы.
-            parts = stripped.split(None, 6)
-            if len(parts) == 7:
-                fixed_spaces += 1
-        if len(parts) < 7:
-            bad_lines += 1
-            continue
-
-        parts = [p.strip() for p in parts[:6]] + [parts[6].strip()]
-        domain_raw, name = parts[0], parts[5]
-
-        prefix = HTTPONLY_PREFIX if domain_raw.startswith(HTTPONLY_PREFIX) else ""
-        domain = domain_raw[len(prefix):]
+        prefix = "#HttpOnly_" if httponly else ""
         base = domain.lstrip(".").lower()
 
+        parts = [
+            f"{prefix}{domain}",
+            subdomains.upper(),
+            path,
+            secure.upper(),
+            expiry,
+            name,
+            value,
+        ]
         variants = [parts]
 
         # Дублируем куки для второго домена (x.com <-> twitter.com).
-        if base in X_DOMAINS:
-            other = X_DOMAINS[base]
+        if base in ("x.com", "twitter.com"):
+            other = "twitter.com" if base == "x.com" else "x.com"
             dot = "." if domain.startswith(".") else ""
             copy = list(parts)
             copy[0] = f"{prefix}{dot}{other}"
@@ -104,8 +138,8 @@ def prepare_cookies() -> str | None:
             names.add(name)
             if name == "auth_token":
                 try:
-                    expiry = int(parts[4])
-                    if expiry and expiry < now:
+                    exp = int(expiry)
+                    if exp and exp < now:
                         expired_auth = True
                 except ValueError:
                     pass
@@ -120,40 +154,51 @@ def prepare_cookies() -> str | None:
     has_ct0 = "ct0" in names
 
     logger.info(
-        "Cookies разобраны: строк=%d, битых=%d, "
-        "исправлено_пробелов=%d, auth_token=%s, ct0=%s",
+        "Cookies разобраны: записей=%d, auth_token=%s, ct0=%s",
         len(result_lines),
-        bad_lines,
-        fixed_spaces,
         has_auth,
         has_ct0,
     )
 
+    if not result_lines:
+        logger.warning(
+            "Ни одной записи cookie не распознано. Проверь формат: "
+            "нужен Netscape cookies.txt (7 полей в строке). "
+            "Надёжнее передать файл через X_COOKIES_B64."
+        )
+        return None
+
     if not has_auth or not has_ct0:
         logger.warning(
-            "В cookies нет auth_token и/или ct0 для x.com/twitter.com. "
-            "Авторизация не заработает — экспортируй cookies заново."
+            "Нет auth_token и/или ct0 для x.com/twitter.com — "
+            "авторизация не заработает, экспортируй cookies заново."
         )
     if expired_auth:
         logger.warning(
-            "Срок действия auth_token уже истёк — нужен свежий экспорт."
+            "Срок действия auth_token истёк — нужен свежий экспорт."
         )
-    if not result_lines:
-        return None
 
     content = "# Netscape HTTP Cookie File\n" + "\n".join(result_lines) + "\n"
 
-    # Проверяем, что yt-dlp сам читает этот файл.
+    # Проверяем, что yt-dlp сам читает получившийся файл.
     try:
         from yt_dlp.cookies import YoutubeDLCookieJar
 
-        fd, test_path = tempfile.mkstemp(prefix="x_cookies_test_", suffix=".txt")
+        fd, test_path = tempfile.mkstemp(
+            prefix="x_cookies_test_", suffix=".txt"
+        )
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
                 f.write(content)
+
             jar = YoutubeDLCookieJar(test_path)
             jar.load(ignore_discard=True, ignore_expires=True)
-            loaded = {c.name for c in jar if "x.com" in c.domain or "twitter.com" in c.domain}
+
+            loaded = {
+                c.name
+                for c in jar
+                if "x.com" in c.domain or "twitter.com" in c.domain
+            }
             logger.info(
                 "yt-dlp загрузил cookies: всего=%d, auth_token=%s, ct0=%s",
                 len(list(jar)),
@@ -218,6 +263,7 @@ def download_video(url: str, folder: str) -> Path:
             "overwrites": True,
         }
 
+        # Передаём cookies через временный файл Netscape.
         if COOKIES_CONTENT:
             fd, cookies_path = tempfile.mkstemp(
                 prefix="x_cookies_",
@@ -245,6 +291,7 @@ def download_video(url: str, folder: str) -> Path:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
+        # Ищем только результат загрузки в нашей временной папке.
         folder_path = Path(folder)
         files = [
             path
@@ -267,6 +314,7 @@ def download_video(url: str, folder: str) -> Path:
         return video_path
 
     finally:
+        # Не оставляем временный файл авторизации.
         if cookies_path:
             try:
                 os.remove(cookies_path)
@@ -303,6 +351,7 @@ async def download_video_handler(message: types.Message):
 
             size = video_path.stat().st_size
 
+            # Ограничение для отправки через обычный Bot API.
             if size > 49 * 1024 * 1024:
                 await status_msg.edit_text(
                     "Видео слишком большое для отправки "
