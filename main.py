@@ -113,11 +113,14 @@ async def download_video_handler(message: types.Message):
 
         await status_msg.delete()
 
-    except Exception:
+    except Exception as e:
+        import logging
+        logging.exception("Ошибка при обработке видео")
+
+        error_text = f"{type(e).__name__}: {e}"
         await status_msg.edit_text(
-            "Не удалось скачать или отправить видео. "
-            "Возможно, публикация недоступна или X изменил способ "
-            "выдачи видео. Попробуй другую ссылку."
+            f"Не удалось обработать видео.\n\n"
+            f"Ошибка: {error_text[:2500]}"
         )
 
 
