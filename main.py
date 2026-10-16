@@ -26,6 +26,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 X_COOKIES = os.getenv("X_COOKIES")
 X_COOKIES_B64 = os.getenv("X_COOKIES_B64")
 
+MAX_FILE_SIZE = 49 * 1024 * 1024  # лимит Bot API на отправку файла
+ALBUM_SIZE = 10                   # максимум элементов в альбоме Telegram
+
 if not BOT_TOKEN:
     raise RuntimeError("Не задана переменная окружения BOT_TOKEN")
 
@@ -82,7 +85,6 @@ def prepare_cookies() -> str | None:
     if "\t" not in raw and "\\t" in raw:
         raw = raw.replace("\\t", "\t")
 
-    # Диагностика формата без вывода значений.
     logger.info(
         "Источник=%s, длина=%d, строк=%d, табов=%d, "
         "начинается_с_#=%s, есть_auth_token=%s, есть_ct0=%s",
@@ -245,18 +247,22 @@ def is_x_url(url: str) -> bool:
 
 # ---------- Скачивание видео ----------
 
-def download_video(url: str, folder: str) -> Path:
-    output_template = str(Path(folder) / "%(id)s.%(ext)s")
+def download_videos(url: str, folder: str) -> list[Path]:
+    """Скачивает все видео поста и возвращает список файлов по порядку."""
+    # autonumber гарантирует уникальные имена и сохраняет порядок видео.
+    output_template = str(
+        Path(folder) / "%(autonumber)05d_%(id)s.%(ext)s"
+    )
     cookies_path = None
 
     try:
         ydl_opts = {
             "format": "best[ext=mp4]/best",
             "outtmpl": output_template,
-            "noplaylist": True,
+            "noplaylist": False,    # скачиваем все видео поста, не только первое
             "quiet": True,
-            "no_warnings": False,   # предупреждения yt-dlp тоже полезны
-            "logger": logger,       # весь вывод yt-dlp идёт в наш logging
+            "no_warnings": False,
+            "logger": logger,
             "socket_timeout": 30,
             "retries": 3,
             "fragment_retries": 3,
@@ -292,26 +298,26 @@ def download_video(url: str, folder: str) -> Path:
             ydl.download([url])
 
         # Ищем только результат загрузки в нашей временной папке.
-        folder_path = Path(folder)
-        files = [
-            path
-            for path in folder_path.iterdir()
-            if path.is_file()
-            and path.suffix.lower() not in (".part", ".ytdl", ".txt")
-            and path.stat().st_size > 0
-        ]
+        files = sorted(
+            (
+                path
+                for path in Path(folder).iterdir()
+                if path.is_file()
+                and path.suffix.lower() not in (".part", ".ytdl", ".txt")
+                and path.stat().st_size > 0
+            ),
+            key=lambda path: path.name,
+        )
 
         if not files:
             raise RuntimeError("yt-dlp завершился, но видеофайл не найден.")
 
-        video_path = max(files, key=lambda path: path.stat().st_size)
-
         logger.info(
-            "Видео загружено: %s, размер=%d байт",
-            video_path.name,
-            video_path.stat().st_size,
+            "Видео загружено: файлов=%d, размеры=%s",
+            len(files),
+            [path.stat().st_size for path in files],
         )
-        return video_path
+        return files
 
     finally:
         # Не оставляем временный файл авторизации.
@@ -320,6 +326,30 @@ def download_video(url: str, folder: str) -> Path:
                 os.remove(cookies_path)
             except OSError:
                 logger.warning("Не удалось удалить временный файл cookies.")
+
+
+# ---------- Отправка в Telegram ----------
+
+async def send_videos(message: types.Message, files: list[Path]) -> None:
+    """Отправляет одно видео обычным сообщением, несколько — альбомами."""
+    for start in range(0, len(files), ALBUM_SIZE):
+        chunk = files[start:start + ALBUM_SIZE]
+        caption = "Готово!" if start == 0 else None
+
+        if len(chunk) == 1:
+            await message.answer_video(
+                video=types.FSInputFile(str(chunk[0])),
+                caption=caption,
+            )
+        else:
+            media = [
+                types.InputMediaVideo(
+                    media=types.FSInputFile(str(path)),
+                    caption=caption if index == 0 else None,
+                )
+                for index, path in enumerate(chunk)
+            ]
+            await message.answer_media_group(media=media)
 
 
 # ---------- Команды Telegram ----------
@@ -345,26 +375,33 @@ async def download_video_handler(message: types.Message):
 
     try:
         with tempfile.TemporaryDirectory(prefix="x_video_") as temp_dir:
-            video_path = await asyncio.to_thread(
-                download_video, url, temp_dir
+            files = await asyncio.to_thread(
+                download_videos, url, temp_dir
             )
 
-            size = video_path.stat().st_size
+            sendable = [p for p in files if p.stat().st_size <= MAX_FILE_SIZE]
+            skipped = len(files) - len(sendable)
 
-            # Ограничение для отправки через обычный Bot API.
-            if size > 49 * 1024 * 1024:
+            if not sendable:
                 await status_msg.edit_text(
                     "Видео слишком большое для отправки "
                     "этим ботом через стандартный Telegram Bot API."
                 )
                 return
 
-            await status_msg.edit_text("Отправляю видео...")
-
-            await message.answer_video(
-                video=types.FSInputFile(str(video_path)),
-                caption="Готово!",
+            await status_msg.edit_text(
+                f"Отправляю видео ({len(sendable)} шт.)..."
+                if len(sendable) > 1
+                else "Отправляю видео..."
             )
+
+            await send_videos(message, sendable)
+
+            if skipped:
+                await message.answer(
+                    f"Пропущено видео: {skipped} (больше 49 МБ, "
+                    "не помещаются в лимит Telegram Bot API)."
+                )
 
         await status_msg.delete()
 
